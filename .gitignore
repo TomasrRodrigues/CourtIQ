@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Outputs
+outputs/videos/*
+outputs/logs/*
+
+# Models
+*.pt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db

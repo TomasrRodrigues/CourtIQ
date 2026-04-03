@@ -1,0 +1,17 @@
+video:
+  input_path: "data/sample.mp4"
+  resize_width: 640
+
+detection:
+  model_path: "yolov8n.pt"
+  conf_threshold: 0.3
+
+tracking:
+  tracker_type: "bytetrack"
+
+trajectory:
+  max_length: 50
+
+output:
+  save_video: true
+  output_path: "outputs/videos/output.mp4"
