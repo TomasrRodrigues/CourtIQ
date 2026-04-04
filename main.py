@@ -3,14 +3,36 @@ import numpy as np
 from data.video_loader import VideoLoader
 from ultralytics import YOLO
 import math
+from scipy.optimize import linear_sum_assignment
 
 CLASS_MAP = {
     0: "person",
     32: "ball",
 }
 
-DIST_THRESHOLD = 80
+DIST_THRESHOLD = 120
+IOU_THRESHOLD = 0.1
 MAX_MISSED = 10
+MIN_HITS_TO_CONFIRM = 3
+
+
+def distance(c1, c2):
+    return math.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+
+
+def iou(b1, b2):
+    x1 = max(b1[0], b2[0])
+    y1 = max(b1[1], b2[1])
+    x2 = min(b1[2], b2[2])
+    y2 = min(b1[3], b2[3])
+
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+
+    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+
+    return inter / (area1 + area2 - inter + 1e-6)
+
 
 
 class KalmanTrack:
@@ -18,6 +40,9 @@ class KalmanTrack:
         self.id = track_id
         self.class_name = cls
         self.missed = 0
+
+        self.hits = 1
+        self.confirmed = False
 
         self.kalman = cv2.KalmanFilter(4, 2)
 
@@ -57,11 +82,9 @@ class KalmanTrack:
         ], dtype=np.float32)
         self.kalman.correct(measurement)
 
-
-
-def distance(c1, c2):
-    return math.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
-
+        self.hits += 1
+        if self.hits >= MIN_HITS_TO_CONFIRM:
+            self.confirmed = True
 
 
 def quick_test():
@@ -86,7 +109,7 @@ def quick_test():
 
             if cls not in CLASS_MAP:
                 continue
-            if conf < 0.4:
+            if conf < 0.5:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -100,55 +123,105 @@ def quick_test():
             })
 
 
-        predictions = {}
-        for tid, track in tracks.items():
+        track_ids = list(tracks.keys())
+        track_list = [tracks[tid] for tid in track_ids]
+
+        num_tracks = len(track_list)
+        num_dets = len(detections)
+
+        predictions = []
+        for track in track_list:
             pred_center = track.predict()
-            predictions[tid] = pred_center
-            track.missed += 1  
+            predictions.append(pred_center)
+            track.missed += 1
 
-        used_tracks = set()
-        updated_tracks = {}
 
-        for det in detections:
-            best_id = None
-            best_dist = float("inf")
+        if num_tracks > 0 and num_dets > 0:
+            cost_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
 
-            for tid, track in tracks.items():
-                if track.class_name != det["class"]:
+            alpha = 0.7
+            beta = 0.3
+
+            for i, track in enumerate(track_list):
+                for j, det in enumerate(detections):
+
+                    if track.class_name != det["class"]:
+                        cost_matrix[i, j] = 1e6
+                        continue
+
+                    if track.bbox is not None:
+                        iou_score = iou(track.bbox, det["bbox"])
+                        if iou_score < IOU_THRESHOLD:
+                            cost_matrix[i, j] = 1e6
+                            continue
+                    else:
+                        iou_score = 0
+
+                    dist = distance(predictions[i], det["center"])
+
+                    cost_matrix[i, j] = alpha * dist + beta * (1 - iou_score)
+
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+            used_tracks = set()
+            used_dets = set()
+            updated_tracks = {}
+
+            for r, c in zip(row_ind, col_ind):
+
+                if r >= num_tracks or c >= num_dets:
                     continue
-                if tid in used_tracks:
+
+                if cost_matrix[r, c] > DIST_THRESHOLD:
                     continue
 
-                pred_center = predictions[tid]
-                d = distance(det["center"], pred_center)
+                track_id = track_ids[r]
+                track = tracks[track_id]
+                det = detections[c]
 
-                if d < best_dist and d < DIST_THRESHOLD:
-                    best_dist = d
-                    best_id = tid
-
-            if best_id is not None:
-                track = tracks[best_id]
                 track.update(det["center"])
                 track.bbox = det["bbox"]
                 track.missed = 0
 
-                updated_tracks[best_id] = track
-                used_tracks.add(best_id)
-            else:
+                updated_tracks[track_id] = track
+
+                used_tracks.add(track_id)
+                used_dets.add(c)
+
+            for tid in track_ids:
+                if tid not in used_tracks:
+                    track = tracks[tid]
+                    updated_tracks[tid] = track
+
+            for j, det in enumerate(detections):
+                if j in used_dets:
+                    continue
+
                 new_track = KalmanTrack(next_id, det["center"], det["class"])
                 new_track.bbox = det["bbox"]
 
                 updated_tracks[next_id] = new_track
                 next_id += 1
 
+            tracks = {
+                tid: t for tid, t in updated_tracks.items()
+                if t.missed <= MAX_MISSED
+            }
 
-        tracks = {
-            tid: t for tid, t in updated_tracks.items()
-            if t.missed <= MAX_MISSED
-        }
+        else:
+            for det in detections:
+                new_track = KalmanTrack(next_id, det["center"], det["class"])
+                new_track.bbox = det["bbox"]
+                tracks[next_id] = new_track
+                next_id += 1
 
 
         for tid, track in tracks.items():
+
+            if not track.confirmed:
+                continue
+
             if track.bbox is None:
                 continue
 
