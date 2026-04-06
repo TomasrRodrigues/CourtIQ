@@ -41,7 +41,16 @@ class CourtIQPipeline:
         if self.filter_fn:
             detections = self.filter_fn(raw_detections, frame)
 
-        tracks = self.tracker.update(detections)
+        high_conf = []
+        low_conf = []
+
+        for det in detections:
+            if det["conf"] >= 0.5:
+                high_conf.append(det)
+            else:
+                low_conf.append(det)
+
+        tracks = self.tracker.update(high_conf, low_conf)
 
         return {
             "raw_detections": raw_detections,

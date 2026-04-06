@@ -41,28 +41,7 @@ class Tracker:
         self.tracks = {}
         self.next_id = 0
 
-    def update(self, detections):
-        """
-        Updates tracker state with current-frame detections.
-
-        Args:
-            detections (list[dict]): Each detection should contain:
-                center: (x, y) center point
-                bbox: [x1, y1, x2, y2]
-                class: class label string
-                conf: optional confidence in [0, 1] (defaults to 1.0)
-    
-        Returns:
-            dict[int, KalmanTrack]: Active tracks after association and pruning.
-    
-        Matching details:
-            Rejects class-mismatched pairs.
-            Rejects pairs above adaptive distance threshold:
-                DIST_THRESHOLD + 0.5 * current_speed.
-            Uses combined cost:
-                ALPHA * normalized_distance + BETA * (1 - IoU) + 0.2 * (1 - confidence).
-            Hungarian assignment finds minimum total cost, then MATCH_THRESHOLD filters weak pairs.
-        """
+    def update(self, high_dets, low_dets):
         track_ids = list(self.tracks.keys())
         track_list = [self.tracks[tid] for tid in track_ids]
 
@@ -71,61 +50,17 @@ class Tracker:
             predictions[tid] = track.predict()
             track.age += 1
 
-        num_tracks = len(track_list)
-        num_dets = len(detections)
 
-        if num_tracks == 0:
-            for det in detections:
-                self._add_track(det)
-            return self.tracks
-
-        cost_matrix = np.zeros((num_tracks, num_dets), dtype=np.float32)
-
-        for i, track in enumerate(track_list):
-            track_id = track_ids[i]
-
-            for j, det in enumerate(detections):
-
-                if track.class_name != det["class"]:
-                    cost_matrix[i, j] = 1e6
-                    continue
-
-                pred = predictions[track_id]
-                dist = distance(pred, det["center"])
-
-                vel = np.linalg.norm(track.kalman.statePost[2:4])
-                adaptive_threshold = DIST_THRESHOLD + vel * 0.5
-
-                if dist > adaptive_threshold:
-                    cost_matrix[i, j] = 1e6
-                    continue
-
-                if track.bbox is not None:
-                    iou_score = iou(track.bbox, det["bbox"])
-                else:
-                    iou_score = 0.0
-
-                norm_dist = dist / DIST_THRESHOLD
-
-                conf = det.get("conf", 1.0)
-
-                cost_matrix[i, j] = (
-                    ALPHA * norm_dist +
-                    BETA * (1 - iou_score) +
-                    0.2 * (1 - conf)
-                )
-
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        matches, unmatched_tracks, unmatched_dets = self._match(
+            track_list, track_ids, predictions, high_dets
+        )
 
         used_tracks = set()
         used_dets = set()
 
-        for r, c in zip(row_ind, col_ind):
-            if cost_matrix[r, c] > MATCH_THRESHOLD:
-                continue
-
+        for r, c in matches:
             track = track_list[r]
-            det = detections[c]
+            det = high_dets[c]
 
             track.update(det["center"], det["bbox"])
             track.missed = 0
@@ -133,11 +68,30 @@ class Tracker:
             used_tracks.add(track.id)
             used_dets.add(c)
 
+        remaining_tracks = [t for t in track_list if t.id not in used_tracks]
+        remaining_ids = [t.id for t in remaining_tracks]
+
+        if len(remaining_tracks) > 0 and len(low_dets) > 0:
+            predictions_low = {tid: predictions[tid] for tid in remaining_ids}
+
+            matches_low, _, _ = self._match(
+                remaining_tracks, remaining_ids, predictions_low, low_dets
+            )
+
+            for r, c in matches_low:
+                track = remaining_tracks[r]
+                det = low_dets[c]
+
+                track.update(det["center"], det["bbox"])
+                track.missed = 0
+
+                used_tracks.add(track.id)
+
+
         for tid in track_ids:
             if tid not in used_tracks:
                 track = self.tracks[tid]
                 track.missed += 1
-
                 track.hits = max(0, track.hits - 1)
 
                 px, py = predictions[tid]
@@ -153,9 +107,11 @@ class Tracker:
                         int(py + h / 2)
                     ]
 
-        for j, det in enumerate(detections):
-            if j not in used_dets:
+
+        for i, det in enumerate(high_dets):
+            if i not in used_dets:
                 self._add_track(det)
+
 
         self.tracks = {
             tid: t for tid, t in self.tracks.items()
@@ -175,3 +131,58 @@ class Tracker:
         track.bbox = det["bbox"]
         self.tracks[self.next_id] = track
         self.next_id += 1
+    
+    def _match(self, track_list, track_ids, predictions, detections):
+        if len(track_list) == 0 or len(detections) == 0:
+            return [], list(range(len(track_list))), list(range(len(detections)))
+
+        cost_matrix = np.zeros((len(track_list), len(detections)), dtype=np.float32)
+
+        for i, track in enumerate(track_list):
+            tid = track_ids[i]
+
+            for j, det in enumerate(detections):
+
+                if track.class_name != det["class"]:
+                    cost_matrix[i, j] = 1e6
+                    continue
+
+                pred = predictions[tid]
+                dist = distance(pred, det["center"])
+
+                vel = np.linalg.norm(track.kalman.statePost[2:4])
+                adaptive_threshold = DIST_THRESHOLD + vel * 0.5
+
+                if dist > adaptive_threshold:
+                    cost_matrix[i, j] = 1e6
+                    continue
+
+                if track.bbox is not None:
+                    iou_score = iou(track.bbox, det["bbox"])
+                else:
+                    iou_score = 0.0
+
+                norm_dist = dist / DIST_THRESHOLD
+                conf = det.get("conf", 1.0)
+
+                cost_matrix[i, j] = (
+                    ALPHA * norm_dist +
+                    BETA * (1 - iou_score) +
+                    0.2 * (1 - conf)
+                )
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        matches = []
+        unmatched_tracks = list(range(len(track_list)))
+        unmatched_dets = list(range(len(detections)))
+
+        for r, c in zip(row_ind, col_ind):
+            if cost_matrix[r, c] > MATCH_THRESHOLD:
+                continue
+
+            matches.append((r, c))
+            unmatched_tracks.remove(r)
+            unmatched_dets.remove(c)
+
+        return matches, unmatched_tracks, unmatched_dets
