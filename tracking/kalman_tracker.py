@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from collections import deque
 
 
 class KalmanTrack:
@@ -14,7 +15,7 @@ class KalmanTrack:
 
         self.bbox = None
         self.embedding = None
-        self.trajectory = []
+        self.trajectory = deque(maxlen=30)
 
         self.kalman = cv2.KalmanFilter(4, 2)
 
@@ -30,7 +31,10 @@ class KalmanTrack:
             [0, 0, 0, 1]
         ], dtype=np.float32)
 
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 25.0
+
+        self.kalman.processNoiseCov = np.diag([10.0, 10.0, 3.0, 3.0]).astype(np.float32)
+
 
         self.kalman.statePre = np.array([
             [center[0]],
@@ -53,12 +57,10 @@ class KalmanTrack:
         """
         pred = self.kalman.predict()
 
-        self.kalman.statePost[2] *= 0.9
-        self.kalman.statePost[3] *= 0.9
-
-        max_vel = 50
-        self.kalman.statePost[2] = np.clip(self.kalman.statePost[2], -max_vel, max_vel)
-        self.kalman.statePost[3] = np.clip(self.kalman.statePost[3], -max_vel, max_vel)
+        self.kalman.statePre[2] *= 0.9
+        self.kalman.statePre[3] *= 0.9
+        self.kalman.statePre[2] = np.clip(self.kalman.statePre[2], -50, 50)
+        self.kalman.statePre[3] = np.clip(self.kalman.statePre[3], -50, 50)
 
         return int(pred[0][0]), int(pred[1][0])
 

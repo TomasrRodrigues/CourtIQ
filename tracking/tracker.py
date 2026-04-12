@@ -20,12 +20,16 @@ from tracking.kalman_tracker import KalmanTrack
 from tracking.utils import iou, distance
 
 DIST_THRESHOLD = 120
-MATCH_THRESHOLD = 1.2
 
-ALPHA = 0.6
-BETA = 0.4
+ALPHA = 0.50   # distance dominates
+BETA  = 0.35   # IoU secondary
+GAMMA = 0.15   # confidence tertiary
+DELTA = 0.10   # motion consistency (trajectory-based tiebreaker)
+MATCH_THRESHOLD = 0.8
 
-MIN_HITS = 1
+# A new track must be seen at least MIN_HITS times before it is
+# subject to hits-based pruning. The age guard below enforces this.
+MIN_HITS = 3
 MAX_MISSED = 10
 
 
@@ -34,12 +38,18 @@ class Tracker:
     Manages active Kalman-based object tracks across frames.
 
     Attributes:
-        tracks: dict[int, KalmanTrack], active tracks indexed by track id
-        next_id: int, next unique id to assign to a new track
+        tracks:              dict[int, KalmanTrack], active tracks by id.
+        next_id:             int, next unique id for a new track.
+        trajectory_builder:  Optional TrajectoryBuilder for motion-consistency
+                             scoring inside the cost matrix.
     """
-    def __init__(self):
+    def __init__(self, trajectory_builder=None):
         self.tracks = {}
         self.next_id = 0
+        # Injected from outside so both the tracker and the pipeline share
+        # the same instance. The tracker reads history (score); the pipeline
+        # writes history (update). No global singleton needed.
+        self.trajectory_builder = trajectory_builder
 
     def update(self, high_dets, low_dets):
         track_ids = list(self.tracks.keys())
@@ -113,9 +123,24 @@ class Tracker:
                 self._add_track(det)
 
 
+        # Pruning logic — three ways a track survives:
+        #
+        #   1. t.confirmed            → already earned its place (≥3 hits).
+        #   2. t.hits >= MIN_HITS     → accumulated enough hits.
+        #   3. t.age < MIN_HITS       → NEW: age guard.
+        #
+        # Why the age guard?
+        # _add_track() spawns tracks at the END of update(), after age
+        # has already been incremented for existing tracks. New tracks
+        # therefore have age=0 at pruning time. Without the age guard,
+        # a brand-new track (hits=1) fails (1 >= 3) and is pruned
+        # immediately — before it ever gets a second detection.
+        # The guard gives every track MIN_HITS frames to accumulate
+        # evidence before the hits-based gate applies.
         self.tracks = {
             tid: t for tid, t in self.tracks.items()
-            if t.missed <= MAX_MISSED and (t.confirmed or t.hits >= MIN_HITS)
+            if t.missed <= MAX_MISSED
+            and (t.confirmed or t.hits >= MIN_HITS or t.age < MIN_HITS)
         }
 
         return self.tracks
@@ -165,10 +190,21 @@ class Tracker:
                 norm_dist = dist / DIST_THRESHOLD
                 conf = det.get("conf", 1.0)
 
+                # Motion-consistency score from trajectory history.
+                # Returns 0.5 (neutral) when history is too short —
+                # so it has no effect until MIN_HITS frames of history exist.
+                if self.trajectory_builder is not None:
+                    consistency = self.trajectory_builder.motion_consistency_score(
+                        track.id, det["center"]
+                    )
+                else:
+                    consistency = 0.5  # neutral fallback
+
                 cost_matrix[i, j] = (
                     ALPHA * norm_dist +
-                    BETA * (1 - iou_score) +
-                    0.2 * (1 - conf)
+                    BETA  * (1 - iou_score) +
+                    GAMMA * (1 - conf) +
+                    DELTA * consistency
                 )
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
